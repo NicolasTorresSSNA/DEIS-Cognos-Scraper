@@ -156,19 +156,32 @@ class CognosScraper:
     def _get_select(self, nombre):
         return self.page.locator(f"#{self._select_ids[nombre]}")
 
-    def aplicar_filtros_base(self, servicio_actual: str = None):
-        """Aplica filtros base seleccionando TODOS los años a la vez y desbloqueando semanas."""
+    def aplicar_filtros_base(self, anios_target: list = None, servicio_actual: str = None):
+        """Aplica filtros base seleccionando los años especificados simultáneamente y desbloqueando semanas."""
         serv_target = servicio_actual or self.config.get("servicio", "TODOS")
-        self.log.info(f"[CONFIG] Aplicando filtros base para servicio '{serv_target}' (TODOS LOS AÑOS)...")
+        anios = anios_target or self.config.get("anios", ANIOS_DISPONIBLES)
+        
+        anios_label = f"{anios[0]}-{anios[-1]}" if len(anios) > 1 else str(anios[0])
+        self.log.info(f"[CONFIG] Aplicando filtros base para servicio '{serv_target}' (Años: {anios_label})...")
         self.descubrir_selectores()
         
-        # 1. Año: Seleccionar TODOS los años disponibles
-        link_id = self._select_ids["anio"].replace("PRMT_SV_", "PRMT_SV_LINK_SELECT_")
-        link = self.page.locator(f"#{link_id}")
-        if link.count() > 0: 
-            link.click()
-        else: 
-            self._get_select("anio").evaluate("el => { for(let o of el.options) o.selected = true; }")
+        # 1. Año: Seleccionar los años especificados simultáneamente
+        if set(anios) == set(ANIOS_DISPONIBLES):
+            link_id = self._select_ids["anio"].replace("PRMT_SV_", "PRMT_SV_LINK_SELECT_")
+            link = self.page.locator(f"#{link_id}")
+            if link.count() > 0: 
+                link.click()
+            else: 
+                self._get_select("anio").evaluate("el => { for(let o of el.options) o.selected = true; }")
+        else:
+            str_anios = [str(a) for a in anios]
+            sel_anio = self._get_select("anio")
+            sel_anio.evaluate("""(el, targetYears) => {
+                for(let o of el.options) {
+                    o.selected = targetYears.includes(o.text.trim());
+                }
+            }""", str_anios)
+
         self.page.wait_for_timeout(2000)
         self.descubrir_selectores()
 
@@ -226,15 +239,15 @@ class CognosScraper:
         if establecimientos:
             self._get_select("establecimiento").select_option(value=establecimientos[0]["value"])
 
-        # 6. Primer click a "Nueva solicitud" para que Cognos cargue todas las semanas de todos los años
-        self.log.info("Enviando primera solicitud con TODOS los años seleccionados...")
+        # 6. Primer click a "Nueva solicitud" para que Cognos cargue todas las semanas de los años seleccionados
+        self.log.info(f"Enviando primera solicitud con años ({anios_label}) seleccionados...")
         boton_nueva = self.page.locator("input[value='Nueva solicitud'], button:has-text('Nueva solicitud')")
         with self.page.expect_response(lambda response: "cognos.cgi" in response.url, timeout=TIMEOUT_REPORTE):
             boton_nueva.first.click()
         self.page.wait_for_timeout(3000)
         self.descubrir_selectores()
 
-        # 7. Semanas: Seleccionar TODAS las semanas (ahora disponibles para todos los años)
+        # 7. Semanas: Seleccionar TODAS las semanas (ahora disponibles para los años seleccionados)
         link_id = self._select_ids["semana"].replace("PRMT_SV_", "PRMT_SV_LINK_SELECT_")
         link = self.page.locator(f"#{link_id}")
         if link.count() > 0: 
@@ -475,8 +488,11 @@ def ejecutar_scraper(config):
         servs = [config.get("servicio", "Metropolitano Suroriente")]
     else:
         servs = servicios
+        
+    anios = config.get("anios", ANIOS_DISPONIBLES)
+    rango_label = f"{anios[0]}-{anios[-1]}" if len(anios) > 1 else str(anios[0])
     
-    console.print("\n[bold cyan]🚀 INICIANDO AUTOMATIZADOR DE DESCARGAS DEIS (TODOS LOS AÑOS)...[/bold cyan]")
+    console.print(f"\n[bold cyan]🚀 INICIANDO AUTOMATIZADOR DE DESCARGAS DEIS (AÑOS: {rango_label})...[/bold cyan]")
     
     try:
         with console.status("[bold blue]Inicializando Chromium...[/bold blue]"):
@@ -485,9 +501,9 @@ def ejecutar_scraper(config):
         for serv in servs:
             console.print(f"\n[bold yellow]🏥 SERVICIO DE SALUD: {serv}[/bold yellow]")
             
-            with console.status(f"[bold yellow]Configurando filtros base para {serv} (Todos los años)...[/bold yellow]"):
+            with console.status(f"[bold yellow]Configurando filtros base para {serv} (Años: {rango_label})...[/bold yellow]"):
                 scraper.navegar_al_reporte()
-                establecimientos = scraper.aplicar_filtros_base(servicio_actual=serv)
+                establecimientos = scraper.aplicar_filtros_base(anios_target=anios, servicio_actual=serv)
                 
             if config.get("establecimiento") != "TODOS" and isinstance(config.get("establecimiento"), dict):
                 establecimientos = [e for e in establecimientos if e["value"] == config["establecimiento"]["value"]]
@@ -511,8 +527,8 @@ def ejecutar_scraper(config):
                 
                 for est in establecimientos:
                     serv_folder = sanitizar_nombre(serv)
-                    nombre_archivo = f"{serv_folder}_{sanitizar_nombre(est['nombre'])}.xlsx"
-                    ruta = dir_salida / serv_folder / nombre_archivo
+                    nombre_archivo = f"{rango_label}_{serv_folder}_{sanitizar_nombre(est['nombre'])}.xlsx"
+                    ruta = dir_salida / serv_folder / rango_label / nombre_archivo
                     
                     if ruta.exists() and ruta.stat().st_size > 0:
                         scraper.total_saltados += 1
@@ -534,7 +550,7 @@ def ejecutar_scraper(config):
                                 progress.console.print(f"[yellow]⚠ Reintentando {est['nombre']} ({intento+2}/{MAX_REINTENTOS})...[/yellow]")
                                 try:
                                     scraper.navegar_al_reporte()
-                                    scraper.aplicar_filtros_base(servicio_actual=serv)
+                                    scraper.aplicar_filtros_base(anios_target=anios, servicio_actual=serv)
                                 except: pass
                                 
                     if exito:

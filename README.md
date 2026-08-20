@@ -1,59 +1,88 @@
 # ❖ DEIS Cognos Scraper - Chile
 
-Automatizador interactivo de descargas de reportes oficiales de **Atenciones de Urgencia** desde el portal IBM Cognos de DEIS (Ministerio de Salud de Chile). 
-
+Automatizador interactivo y de línea de comandos (CLI) para descargar reportes oficiales de **Atenciones de Urgencia** desde el portal IBM Cognos de DEIS (Ministerio de Salud de Chile).
 
 ---
 
 ## ► Requisitos e Instalación
 
-Tener instalado **Python 3.10+** . 
+Tener instalado **Python 3.10+**.
 
 1. **Instalar dependencias:**
    ```bash
    pip install -r requirements.txt
    ```
-2. **Instalar el motor de navegación:**
+2. **Instalar el motor de navegación (Chromium):**
    ```bash
    playwright install chromium
    ```
 
 ---
 
-## ◆ Cómo usarlo
+## ◆ Modo de Uso
 
-Ejecutar el script principal en terminal.
+### 1. Modo Interactivo (Asistente en Terminal)
+Ejecutar el script sin argumentos para abrir el menú interactivo con la librería `rich`:
 
 ```bash
 python scraper.py
 ```
 
-### El asistente preguntará:
-1. **Servicio de Salud:** (Ej: Metropolitano Suroriente, u opción de descargar todo Chile).
-2. **Año Estadístico:** (Ej: 2016, un rango como 2020-2023, o Todos los años).
-3. **Tipo de Establecimiento:** (Todos los tipos, o filtrar por Hospital, SAPU, SAR, etc.).
-4. **Establecimientos:** Elegir de la lista dinámica detectada en tiempo real o descargarlos todos automáticamente, uno por uno.
+**Pasos del asistente:**
+1. **Servicio(s) de Salud:** Seleccionar uno o más Servicios de Salud (ej: `Metropolitano Sur, Metropolitano Suroriente` o `0` para todo Chile).
+2. **Años Estadísticos:** Elegir descargar todos los años (2015-2025), un año específico (ej: `2024`), o un rango personalizado (ej: `2020-2023`).
+3. **Tipo de Establecimiento:** Todos (`Hospital`, `SAPU`, `SAR`, `SUR`, `CEAR`, `PAME`) o uno específico.
+4. **Establecimientos:** Descarga automática 1 a 1 de todos los recintos detectados en tiempo real.
 
 ---
 
-## ■ Estructura del Proyecto
+### 2. Modo Automatizado (CLI / Scripts / CI)
+Puedes ejecutar descargas masivas directamente con parámetros por consola:
+
+```bash
+# Ejemplo 1: Descargar Metropolitana Sur y Suroriente para el rango 2015-2025
+python scraper.py --servicios "Metropolitano Sur" "Metropolitano Suroriente" --anios 2015-2025
+
+# Ejemplo 2: Descargar un año específico mostrando la interfaz gráfica del navegador
+python scraper.py --servicios "Arica" --anios 2024 --visible
+
+# Ejemplo 3: Rango de años personalizado
+python scraper.py --servicios "Metropolitano Oriente" --anios 2020-2023 --silencioso
+```
+
+#### Opciones disponibles en CLI:
+| Parámetro | Descripción | Ejemplo |
+| :--- | :--- | :--- |
+| `--servicios` | Uno o varios Servicios de Salud entre comillas. | `--servicios "Metropolitano Sur" "Metropolitano Suroriente"` |
+| `--anios` / `--anio` | Año único, rango (`DESDE-HASTA`), o `todos`. | `--anios 2015-2025` o `--anios 2024` |
+| `--tipo-est` | Tipo de recinto (`Hospital`, `SAPU`, `SAR`, etc. O`TODOS`). | `--tipo-est TODOS` |
+| `--dir` | Carpeta de destino para las descargas (Por defecto: `./descargas`). | `--dir ./descargas` |
+| `--visible` | Muestra el navegador Chromium en pantalla. | `--visible` |
+| `--silencioso` | Ejecuta sin solicitar confirmaciones interactivas. | `--silencioso` |
+
+---
+
+## ■ Estructura del Proyecto y Descargas
 
 ```text
-cognos/
-├── descargas/           # Carpeta donde se organizan automáticamente los archivos .xlsx
-│   ├── 2015/
-│   ├── 2016/
-│   └── log.txt          # Registro histórico de descargas exitosas y errores
-├── requirements.txt     # Dependencias del proyecto (Playwright, Rich)
-├── scraper.py           # Script principal interactivo
-└── README.md            # Documentación
+DEIS-Cognos-Scraper/
+├── descargas/
+│   ├── Metropolitano_Sur/
+│   │   └── 2015-2025/
+│   │       ├── 2015-2025_Metropolitano_Sur_Hospital_Barros_Luco.xlsx
+│   │       └── 2015-2025_Metropolitano_Sur_SAPU_Padre_Esteban_Gumucio.xlsx
+│   └── log.txt             # Registro detallado de descargas y auditoría
+├── requirements.txt        # Dependencias (Playwright, Rich)
+├── scraper.py              # Script principal
+└── README.md               # Documentación
 ```
 
 ---
 
 ## ◈ Características Destacadas
 
-- **Interfaz Interactiva (UI):** Uso de la librería `rich` para menús amigables, tablas de resumen y barras de progreso en tiempo real.
-- **Listas Dinámicas (Live Fetch):** El script se conecta al servidor para leer la lista *real* de establecimientos dependiendo del Servicio de Salud que elijas, en vez de usar listas desactualizadas.
-- **Auto-recuperación (Resume):** Si cancelas la descarga a la mitad y vuelves a ejecutarlo, el script reconoce los archivos ya descargados y se los salta, retomando donde quedó.
-- **Caché Inteligente (Fast Mode):** Reutiliza la misma sesión de Cognos limpiando el estado dinámicamente mediante el botón Volver para evitar corrupción de datos. Descarga cada archivo de forma segura en ~45s.
+- **Selección Simultánea de Años:** Permite solicitar rangos completos de años (ej: `2015-2025`) seleccionando todos los años especificados al mismo tiempo en el formulario inicial, maximizando la eficiencia.
+- **Desbloqueo Inteligente de Semanas:** Ejecuta automáticamente la primera solicitud para desbloquear todas las semanas estadísticas del período en Cognos y luego realiza la selección masiva de semanas.
+- **Sin Navegación "Volver":** Mantiene la vista de reporte activa para alternar únicamente el establecimiento en cada iteración, acelerando la descarga 1 a 1 de toda la región.
+- **Auto-recuperación (Resume):** Si el proceso se interrumpe, el script reconoce los archivos `.xlsx` válidos en disco y los salta automáticamente al reiniciar.
+- **Listas Dinámicas en Tiempo Real:** Conexión en vivo con el servidor Cognos para leer el catálogo actualizado de recintos por servicio de salud.
