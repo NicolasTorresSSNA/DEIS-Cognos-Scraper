@@ -5,6 +5,7 @@ Descarga automáticamente reportes de "Atenciones de Urgencia" desde http://cogn
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -12,6 +13,14 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from rich.console import Console
@@ -37,7 +46,7 @@ SERVICIOS_DISPONIBLES = [
 ]
 TIPOS_ESTABLECIMIENTO = ["Hospital", "SAPU", "SAR", "SUR", "CEAR", "PAME"]
 
-DIR_DESCARGAS = Path("./descargas")
+DIR_DESCARGAS_DEFAULT = Path("./descargas")
 MAX_REINTENTOS = 3
 TIMEOUT_REPORTE = 180_000
 TIMEOUT_DESCARGA = 120_000
@@ -49,9 +58,10 @@ console = Console()
 # LOGGING (Archivo oculto para debug)
 # ============================================================================
 
-def setup_logging():
-    DIR_DESCARGAS.mkdir(parents=True, exist_ok=True)
-    log_file = DIR_DESCARGAS / "log.txt"
+def setup_logging(base_dir=DIR_DESCARGAS_DEFAULT):
+    base_path = Path(base_dir)
+    base_path.mkdir(parents=True, exist_ok=True)
+    log_file = base_path / "log.txt"
     fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s", datefmt="%H:%M:%S")
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(fmt)
@@ -90,6 +100,7 @@ class CognosScraper:
         self.total_descargados = 0
         self.total_errores = 0
         self.total_saltados = 0
+        self.dir_descargas = Path(config.get("dir", DIR_DESCARGAS_DEFAULT))
 
     def iniciar(self):
         self.log.info("[INICIO] Iniciando navegador Chromium...")
@@ -145,71 +156,116 @@ class CognosScraper:
     def _get_select(self, nombre):
         return self.page.locator(f"#{self._select_ids[nombre]}")
 
-    def aplicar_filtros_base(self, anio: int):
-        """Aplica filtros y retorna la lista de establecimientos reales resultantes."""
-        self.log.info(f"[CONFIG] Aplicando filtros base para {anio}...")
+    def aplicar_filtros_base(self, servicio_actual: str = None):
+        """Aplica filtros base seleccionando TODOS los años a la vez y desbloqueando semanas."""
+        serv_target = servicio_actual or self.config.get("servicio", "TODOS")
+        self.log.info(f"[CONFIG] Aplicando filtros base para servicio '{serv_target}' (TODOS LOS AÑOS)...")
         self.descubrir_selectores()
         
-        # 1. Año
-        self._get_select("anio").select_option(label=str(anio))
+        # 1. Año: Seleccionar TODOS los años disponibles
+        link_id = self._select_ids["anio"].replace("PRMT_SV_", "PRMT_SV_LINK_SELECT_")
+        link = self.page.locator(f"#{link_id}")
+        if link.count() > 0: 
+            link.click()
+        else: 
+            self._get_select("anio").evaluate("el => { for(let o of el.options) o.selected = true; }")
+        self.page.wait_for_timeout(2000)
+        self.descubrir_selectores()
+
+        # 2. Edad (Asegurar que todas las 5 edades estén marcadas)
+        checkboxes = self.page.query_selector_all("input[role='checkbox']") or self.page.query_selector_all("input[type='checkbox']")
+        for cb in checkboxes:
+            try:
+                aria_chk = cb.get_attribute("aria-checked")
+                if aria_chk != "true" and not cb.is_checked():
+                    cb.click()
+                    self.page.wait_for_timeout(100)
+            except Exception:
+                pass
+
+        # 3. Servicio de Salud
+        if serv_target != "TODOS":
+            sel_serv = self._get_select("servicio")
+            val = sel_serv.evaluate("""(el, target) => {
+                let cleanTarget = target.toLowerCase().replace(/\\s+/g, ' ').trim();
+                for(let o of el.options) {
+                    let optTxt = o.text.toLowerCase().replace(/\\s+/g, ' ').trim();
+                    if(optTxt === cleanTarget) return o.value;
+                }
+                for(let o of el.options) {
+                    let optTxt = o.text.toLowerCase().replace(/\\s+/g, ' ').trim();
+                    if(optTxt.includes(cleanTarget)) return o.value;
+                }
+                return null;
+            }""", serv_target)
+            if val:
+                sel_serv.select_option(value=val)
+            else:
+                self.log.warning(f"No se encontró opción para servicio '{serv_target}'")
         self.page.wait_for_timeout(3000)
         self.descubrir_selectores()
 
-        # 2. Semanas
-        if self.config.get("semanas") == "TODAS":
-            link_id = self._select_ids["semana"].replace("PRMT_SV_", "PRMT_SV_LINK_SELECT_")
-            link = self.page.locator(f"#{link_id}")
-            if link.count() > 0: link.click()
-            else: self._get_select("semana").evaluate("el => { for(let o of el.options) o.selected = true; }")
-        else:
-            self._get_select("semana").select_option(label=self.config["semanas"])
-        
-        # 3. Edad (Siempre todas)
-        checkboxes = self.page.query_selector_all("input[role='checkbox']") or self.page.query_selector_all("input[type='checkbox']")
-        for cb in checkboxes:
-            if cb.get_attribute("aria-checked") != "true" and not cb.is_checked():
-                cb.click()
-                self.page.wait_for_timeout(100)
-
-        # 4. Servicio de Salud
-        if self.config["servicio"] != "TODOS":
-            sel_serv = self._get_select("servicio")
-            # Buscar coincidencia
-            val = sel_serv.evaluate(f"""el => {{
-                for(let o of el.options) {{
-                    if(o.text.toLowerCase().includes('{self.config["servicio"].lower().split()[-1]}')) return o.value;
-                }}
-                return null;
-            }}""")
-            if val: sel_serv.select_option(value=val)
-        self.page.wait_for_timeout(4000)
-        self.descubrir_selectores()
-
-        # 5. Tipo de Establecimiento
-        if self.config["tipo_est"] != "TODOS":
-            self._get_select("tipo_est").select_option(label=self.config["tipo_est"])
+        # 4. Tipo de Establecimiento
+        tipo_est = self.config.get("tipo_est", "TODOS")
+        if tipo_est != "TODOS":
+            self._get_select("tipo_est").select_option(label=tipo_est)
         else:
             link_id = self._select_ids["tipo_est"].replace("PRMT_SV_", "PRMT_SV_LINK_SELECT_")
             link = self.page.locator(f"#{link_id}")
             if link.count() > 0: link.click()
             else: self._get_select("tipo_est").evaluate("el => { for(let o of el.options) o.selected = true; }")
-        self.page.wait_for_timeout(4000)
+        self.page.wait_for_timeout(3000)
         self.descubrir_selectores()
 
-        # Obtener lista final
+        # Obtener lista de establecimientos disponibles
         establecimientos = self._get_select("establecimiento").evaluate("""el => {
             return Array.from(el.options).map(o => ({ nombre: o.text.trim(), value: o.value })).filter(o => o.nombre !== '');
         }""")
+
+        # 5. Seleccionar el primer establecimiento para habilitar el envío del formulario
+        if establecimientos:
+            self._get_select("establecimiento").select_option(value=establecimientos[0]["value"])
+
+        # 6. Primer click a "Nueva solicitud" para que Cognos cargue todas las semanas de todos los años
+        self.log.info("Enviando primera solicitud con TODOS los años seleccionados...")
+        boton_nueva = self.page.locator("input[value='Nueva solicitud'], button:has-text('Nueva solicitud')")
+        with self.page.expect_response(lambda response: "cognos.cgi" in response.url, timeout=TIMEOUT_REPORTE):
+            boton_nueva.first.click()
+        self.page.wait_for_timeout(3000)
+        self.descubrir_selectores()
+
+        # 7. Semanas: Seleccionar TODAS las semanas (ahora disponibles para todos los años)
+        link_id = self._select_ids["semana"].replace("PRMT_SV_", "PRMT_SV_LINK_SELECT_")
+        link = self.page.locator(f"#{link_id}")
+        if link.count() > 0: 
+            link.click()
+        else: 
+            self._get_select("semana").evaluate("el => { for(let o of el.options) o.selected = true; }")
+        
+        # 8. Segundo click a "Nueva solicitud" para cargar la vista completa con todas las semanas
+        self.log.info("Enviando segunda solicitud con todas las semanas seleccionadas...")
+        with self.page.expect_response(lambda response: "cognos.cgi" in response.url, timeout=TIMEOUT_REPORTE):
+            boton_nueva.first.click()
+        
+        # Esperar confirmación de que cargó el reporte
+        link_excel = self.page.locator("a:has-text('Descargar como Excel')")
+        link_excel.wait_for(state="visible", timeout=TIMEOUT_REPORTE)
+        self.page.wait_for_timeout(1500)
+        
+        self.descubrir_selectores()
         return establecimientos
 
-    def descargar_establecimiento(self, anio: int, est: dict, ruta_destino: Path):
+    def descargar_establecimiento(self, est: dict, ruta_destino: Path, servicio_actual: str = None):
         # 1. Deseleccionar cualquier establecimiento previo para evitar descargas acumuladas
         if "establecimiento" in self._select_ids:
-            link_id = self._select_ids["establecimiento"].replace("PRMT_SV_", "PRMT_SV_LINK_DESELECT_")
-            link = self.page.locator(f"#{link_id}")
-            if link.count() > 0: 
-                link.click()
-                self.page.wait_for_timeout(400)
+            try:
+                link_id = self._select_ids["establecimiento"].replace("PRMT_SV_", "PRMT_SV_LINK_DESELECT_")
+                link = self.page.locator(f"#{link_id}")
+                if link.count() > 0: 
+                    link.click()
+                    self.page.wait_for_timeout(400)
+            except Exception:
+                pass
             
             # 2. Seleccionar el nuevo
             self._get_select("establecimiento").select_option(value=est["value"])
@@ -218,11 +274,18 @@ class CognosScraper:
         boton = self.page.locator("input[value='Nueva solicitud'], button:has-text('Nueva solicitud')")
         link_excel = self.page.locator("a:has-text('Descargar como Excel')")
         
-        boton.first.click()
+        # Ocultar temporalmente el link para forzar que reaparezca en el DOM/se haga visible al finalizar la carga
+        try:
+            link_excel.evaluate("el => el.style.display = 'none'")
+        except Exception:
+            pass
+
+        with self.page.expect_response(lambda response: "cognos.cgi" in response.url, timeout=TIMEOUT_REPORTE):
+            boton.first.click()
 
         # 4. Esperar dinámicamente al botón de Excel
         link_excel.wait_for(state="visible", timeout=TIMEOUT_REPORTE)
-        self.page.wait_for_timeout(1000)
+        self.page.wait_for_timeout(1500)
         
         ruta_destino.parent.mkdir(parents=True, exist_ok=True)
         
@@ -238,18 +301,9 @@ class CognosScraper:
                 try: p.close()
                 except: pass
         
-        if ruta_destino.exists() and ruta_destino.stat().st_size > 0:
-            # Clickear en "Volver" para regresar a la pantalla de prompts limpia
-            btn_volver = self.page.locator("a:has-text('Volver'), button:has-text('Volver')")
-            if btn_volver.count() > 0:
-                btn_volver.first.click()
-                # Esperar a que los prompts vuelvan a aparecer (input o button)
-                self.page.wait_for_selector("input[value='Nueva solicitud'], button:has-text('Nueva solicitud')", timeout=30_000)
-                self.page.wait_for_timeout(1000)
-                # Re-descubrir selectores
-                self.descubrir_selectores()
-            return True
-        return False
+        exito = ruta_destino.exists() and ruta_destino.stat().st_size > 0
+        self.descubrir_selectores()
+        return exito
 
 # ============================================================================
 # UI INTERACTIVA (Rich)
@@ -262,22 +316,36 @@ def mostrar_banner():
         border_style="cyan"
     ))
 
-def solicitar_servicio():
-    console.print("\n[bold yellow]PASO 1: SELECCIÓN DE SERVICIO DE SALUD[/bold yellow]")
+def solicitar_servicios():
+    console.print("\n[bold yellow]PASO 1: SELECCIÓN DE SERVICIO(S) DE SALUD[/bold yellow]")
     console.print("  [green][0][/green] [bold]TODOS LOS SERVICIOS (Chile Completo)[/bold]")
     for i, serv in enumerate(SERVICIOS_DISPONIBLES, 1):
         console.print(f"  [cyan][{i}][/cyan] {serv}")
             
     while True:
-        opc = Prompt.ask("\n➤ Elige número o nombre (ej: 23 o Suroriente)")
-        if opc == "0" or opc.lower() in ("todos", "all"): return "TODOS"
-        if opc.isdigit() and 1 <= int(opc) <= len(SERVICIOS_DISPONIBLES):
-            return SERVICIOS_DISPONIBLES[int(opc) - 1]
-        coincidencias = [s for s in SERVICIOS_DISPONIBLES if opc.lower() in s.lower()]
-        if len(coincidencias) == 1: return coincidencias[0]
-        if not opc.isdigit() and not coincidencias:
-            return opc # Si lo escribio perfecto y no esta en la lista, lo aceptamos
-        console.print("[red]⚠ Entrada inválida o ambigua.[/red]")
+        opc = Prompt.ask("\n➤ Elige número(s) o nombre(s) (ej: 'Metropolitano Sur, Metropolitano Suroriente' o números separados por coma '22,23')")
+        if opc.strip() == "0" or opc.lower() in ("todos", "all"):
+            return ["TODOS"]
+        
+        # Procesar lista separada por coma o espacio si ingresa varios
+        partes = [p.strip() for p in opc.split(",") if p.strip()]
+        servicios_seleccionados = []
+        valido = True
+        for p in partes:
+            if p.isdigit() and 1 <= int(p) <= len(SERVICIOS_DISPONIBLES):
+                servicios_seleccionados.append(SERVICIOS_DISPONIBLES[int(p) - 1])
+            else:
+                coincidencias = [s for s in SERVICIOS_DISPONIBLES if p.lower() in s.lower()]
+                if len(coincidencias) == 1:
+                    servicios_seleccionados.append(coincidencias[0])
+                elif p in SERVICIOS_DISPONIBLES:
+                    servicios_seleccionados.append(p)
+                else:
+                    console.print(f"[red]⚠ Servicio no reconocido o ambiguo: '{p}'[/red]")
+                    valido = False
+                    break
+        if valido and servicios_seleccionados:
+            return servicios_seleccionados
 
 def solicitar_anios():
     console.print("\n[bold yellow]PASO 2: AÑOS ESTADÍSTICOS[/bold yellow]")
@@ -321,12 +389,13 @@ def solicitar_tipo_est():
 
 def obtener_nombres_establecimientos(config_temp):
     """Obtiene la lista real de nombres usando un scraper headless temporal"""
-    logger = setup_logging()
+    logger = setup_logging(config_temp.get("dir", DIR_DESCARGAS_DEFAULT))
     scraper = CognosScraper(config_temp, logger)
+    serv = config_temp["servicios"][0] if isinstance(config_temp.get("servicios"), list) else config_temp.get("servicio", "TODOS")
     try:
         scraper.iniciar()
         scraper.navegar_al_reporte()
-        return scraper.aplicar_filtros_base(config_temp["anios"][0])
+        return scraper.aplicar_filtros_base(servicio_actual=serv)
     except Exception as e:
         console.print(f"[red]Error consultando Cognos: {e}[/red]")
         return []
@@ -334,13 +403,14 @@ def obtener_nombres_establecimientos(config_temp):
         scraper.cerrar()
 
 def solicitar_establecimiento(config_temp):
-    console.print("\n[bold yellow]PASO 4: ESTABLECIMIENTOS[/bold yellow]")
+    console.print("\n[bold yellow]PASO 2: ESTABLECIMIENTOS[/bold yellow]")
     console.print("  [cyan][1][/cyan] Todos los establecimientos (Descarga automática 1 a 1)")
     console.print("  [cyan][2][/cyan] Elegir específico de la lista")
     opc = Prompt.ask("➤ Elige opción", choices=["1", "2"], default="1")
     
     if opc == "2":
-        if config_temp["servicio"] != "TODOS":
+        servs = config_temp.get("servicios", [config_temp.get("servicio")])
+        if servs != ["TODOS"]:
             with console.status("[bold cyan]⏳ Conectando a Cognos DEIS para obtener los nombres reales...[/bold cyan]", spinner="dots"):
                 lista = obtener_nombres_establecimientos(config_temp)
             if lista:
@@ -361,22 +431,23 @@ def main_interactivo():
     mostrar_banner()
     
     config = {}
-    config["servicio"] = solicitar_servicio()
-    config["anios"] = solicitar_anios()
-    config["semanas"] = "TODAS"  # Hardcoded segun req para simplificar menu
+    config["servicios"] = solicitar_servicios()
+    config["anios"] = ANIOS_DISPONIBLES
+    config["semanas"] = "TODAS"
     config["tipo_est"] = solicitar_tipo_est()
     config["establecimiento"] = solicitar_establecimiento(config)
-    
+    config["dir"] = DIR_DESCARGAS_DEFAULT
     config["visible"] = False
     
     # Resumen
     est_str = "Todos (Descarga 1 por 1)" if config['establecimiento'] == 'TODOS' else config['establecimiento']['nombre']
-    
+    serv_str = ", ".join(config['servicios']) if isinstance(config['servicios'], list) else config['servicios']
+
     tabla = Table(title="📋 RESUMEN DE CONFIGURACIÓN", border_style="green")
     tabla.add_column("Parámetro", style="bold")
     tabla.add_column("Valor", style="cyan")
-    tabla.add_row("🏥 Servicio", config['servicio'])
-    tabla.add_row("📅 Años", f"{config['anios'][0]} a {config['anios'][-1]}" if len(config['anios'])>1 else str(config['anios'][0]))
+    tabla.add_row("🏥 Servicio(s)", serv_str)
+    tabla.add_row("📅 Años", "[green]Todos (2015-2025)[/green]")
     tabla.add_row("📊 Semanas", config['semanas'])
     tabla.add_row("👥 Grupos de edad", "[green]Todos (5 grupos marcados)[/green]")
     tabla.add_row("🏢 Tipo Establecimiento", config['tipo_est'])
@@ -395,34 +466,38 @@ def main_interactivo():
 # ============================================================================
 
 def ejecutar_scraper(config):
-    logger = setup_logging()
+    dir_salida = Path(config.get("dir", DIR_DESCARGAS_DEFAULT))
+    logger = setup_logging(dir_salida)
     scraper = CognosScraper(config, logger)
     
-    # Usar panel y barras de progreso de rich
-    console.print("\n[bold cyan]🚀 INICIANDO AUTOMATIZADOR DE DESCARGAS DEIS...[/bold cyan]")
+    servicios = config.get("servicios")
+    if not servicios:
+        servs = [config.get("servicio", "Metropolitano Suroriente")]
+    else:
+        servs = servicios
+    
+    console.print("\n[bold cyan]🚀 INICIANDO AUTOMATIZADOR DE DESCARGAS DEIS (TODOS LOS AÑOS)...[/bold cyan]")
     
     try:
         with console.status("[bold blue]Inicializando Chromium...[/bold blue]"):
             scraper.iniciar()
         
-        for anio in config["anios"]:
-            console.print(f"\n[bold magenta]📅 AÑO ESTADÍSTICO: {anio}[/bold magenta]")
+        for serv in servs:
+            console.print(f"\n[bold yellow]🏥 SERVICIO DE SALUD: {serv}[/bold yellow]")
             
-            with console.status(f"[bold yellow]Configurando filtros base para {anio}...[/bold yellow]"):
+            with console.status(f"[bold yellow]Configurando filtros base para {serv} (Todos los años)...[/bold yellow]"):
                 scraper.navegar_al_reporte()
-                establecimientos = scraper.aplicar_filtros_base(anio)
+                establecimientos = scraper.aplicar_filtros_base(servicio_actual=serv)
                 
-            if config["establecimiento"] != "TODOS":
-                # Filtrar solo el elegido
+            if config.get("establecimiento") != "TODOS" and isinstance(config.get("establecimiento"), dict):
                 establecimientos = [e for e in establecimientos if e["value"] == config["establecimiento"]["value"]]
                 
             if not establecimientos:
-                console.print(f"[red]⚠ No se encontraron establecimientos para {anio}.[/red]")
+                console.print(f"[red]⚠ No se encontraron establecimientos para {serv}.[/red]")
                 continue
                 
-            console.print(f"[green]✓ Filtros aplicados. {len(establecimientos)} archivo(s) por descargar.[/green]\n")
+            console.print(f"[green]✓ Filtros aplicados con éxito. {len(establecimientos)} archivo(s) por descargar.[/green]\n")
             
-            # Progress bar para este año
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -432,11 +507,12 @@ def ejecutar_scraper(config):
                 console=console,
             ) as progress:
                 
-                task_id = progress.add_task(f"Descargando {anio}...", total=len(establecimientos))
+                task_id = progress.add_task(f"Descargando {serv}...", total=len(establecimientos))
                 
                 for est in establecimientos:
-                    nombre_archivo = f"{anio}_{sanitizar_nombre(est['nombre'])}.xlsx"
-                    ruta = DIR_DESCARGAS / str(anio) / nombre_archivo
+                    serv_folder = sanitizar_nombre(serv)
+                    nombre_archivo = f"{serv_folder}_{sanitizar_nombre(est['nombre'])}.xlsx"
+                    ruta = dir_salida / serv_folder / nombre_archivo
                     
                     if ruta.exists() and ruta.stat().st_size > 0:
                         scraper.total_saltados += 1
@@ -446,21 +522,19 @@ def ejecutar_scraper(config):
                         
                     progress.update(task_id, description=f"Descargando: [cyan]{est['nombre']}[/cyan]")
                     
-                    # Reintentos
                     exito = False
                     for intento in range(MAX_REINTENTOS):
                         try:
-                            if scraper.descargar_establecimiento(anio, est, ruta):
+                            if scraper.descargar_establecimiento(est, ruta, servicio_actual=serv):
                                 exito = True
                                 break
                         except Exception as e:
                             logger.error(f"Intento {intento+1} falló: {e}")
                             if intento < MAX_REINTENTOS - 1:
                                 progress.console.print(f"[yellow]⚠ Reintentando {est['nombre']} ({intento+2}/{MAX_REINTENTOS})...[/yellow]")
-                                # Recuperar estado: si fallo el popup, intentamos recargar
                                 try:
                                     scraper.navegar_al_reporte()
-                                    scraper.aplicar_filtros_base(anio)
+                                    scraper.aplicar_filtros_base(servicio_actual=serv)
                                 except: pass
                                 
                     if exito:
@@ -471,7 +545,7 @@ def ejecutar_scraper(config):
                         progress.console.print(f"[red]✗ FALLO: {nombre_archivo}[/red]")
                     
                     progress.advance(task_id)
-                    time.sleep(1) # Pausa minima para no saturar al servidor
+                    time.sleep(1)
 
     except KeyboardInterrupt:
         console.print("\n[red]⛔ Proceso cancelado por el usuario.[/red]")
@@ -480,7 +554,6 @@ def ejecutar_scraper(config):
         logger.exception("Error fatal")
     finally:
         scraper.cerrar()
-        # Resumen final
         resumen = Panel(
             f"✅ [green]Descargados:[/green] {scraper.total_descargados}\n"
             f"⏭  [yellow]Saltados:[/yellow]    {scraper.total_saltados}\n"
@@ -496,21 +569,44 @@ def ejecutar_scraper(config):
 # ENTRY POINT
 # ============================================================================
 
+def parsear_anios_arg(val):
+    if not val:
+        return ANIOS_DISPONIBLES
+    val = val.strip().lower()
+    if val in ("todos", "all"):
+        return ANIOS_DISPONIBLES
+    if "-" in val:
+        partes = val.split("-")
+        if len(partes) == 2 and partes[0].isdigit() and partes[1].isdigit():
+            desde, hasta = int(partes[0]), int(partes[1])
+            return [a for a in range(desde, hasta + 1) if a in ANIOS_DISPONIBLES]
+    if "," in val:
+        partes = [p.strip() for p in val.split(",") if p.strip().isdigit()]
+        return [int(p) for p in partes if int(p) in ANIOS_DISPONIBLES]
+    if val.isdigit() and int(val) in ANIOS_DISPONIBLES:
+        return [int(val)]
+    return ANIOS_DISPONIBLES
+
 def main():
-    parser = argparse.ArgumentParser(description="Descarga automatica COGNOS DEIS")
-    parser.add_argument("--anio", type=int, help="Descargar solo un anio especifico")
+    parser = argparse.ArgumentParser(description="Descarga automática COGNOS DEIS")
+    parser.add_argument("--servicios", nargs="+", help="Servicios de Salud (ej: 'Metropolitano Sur' 'Metropolitano Suroriente')")
+    parser.add_argument("--anio", "--anios", type=str, dest="anios", help="Descargar año o rango de años (ej: 2015-2025, 2024, o todos)")
+    parser.add_argument("--tipo-est", type=str, default="TODOS", help="Tipo de establecimiento (Hospital, SAPU, SAR, SUR, CEAR, PAME o TODOS)")
+    parser.add_argument("--dir", type=str, default="./descargas", help="Directorio de destino para descargas")
     parser.add_argument("--silencioso", action="store_true", help="No interactivo")
     parser.add_argument("--visible", action="store_true", help="Mostrar navegador")
     args = parser.parse_args()
 
-    if args.silencioso or args.anio:
+    if args.silencioso or args.servicios or args.anios:
         # Modo cli automatizado
+        servs = args.servicios if args.servicios else ["Metropolitano Sur", "Metropolitano Suroriente"]
         config = {
-            "servicio": "Metropolitano Suroriente",
-            "anios": [args.anio] if args.anio else ANIOS_DISPONIBLES,
+            "servicios": servs,
+            "anios": parsear_anios_arg(args.anios),
             "semanas": "TODAS",
-            "tipo_est": "TODOS",
+            "tipo_est": args.tipo_est,
             "establecimiento": "TODOS",
+            "dir": args.dir,
             "visible": args.visible
         }
         ejecutar_scraper(config)
